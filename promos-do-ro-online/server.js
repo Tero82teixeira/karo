@@ -147,8 +147,41 @@ async function resolveMlLink(raw){
   }catch(e){problem=e.name==='TimeoutError'?'Tempo de consulta esgotado':'Não foi possível confirmar o redirecionamento';}
   return {final_url:current.origin+current.pathname,reference:mlReference(current),redirect_checked:current.hostname!=='meli.la',redirect_error:problem};
 }
+
+const mlCryptoKey=crypto.createHash('sha256').update(SECRET+':ml-oauth-v1').digest();
+function encryptToken(t){const iv=crypto.randomBytes(12),c=crypto.createCipheriv('aes-256-gcm',mlCryptoKey,iv);const cipher=Buffer.concat([c.update(String(t),'utf8'),c.final()]);return Buffer.concat([iv,c.getAuthTag(),cipher]).toString('base64url');}
+function decryptToken(t){const b=Buffer.from(t,'base64url'),d=crypto.createDecipheriv('aes-256-gcm',mlCryptoKey,b.subarray(0,12));d.setAuthTag(b.subarray(12,28));return Buffer.concat([d.update(b.subarray(28)),d.final()]).toString('utf8');}
+const mlOauthReady=()=>Boolean(process.env.ML_CLIENT_ID&&process.env.ML_CLIENT_SECRET&&process.env.ML_REDIRECT_URI&&String(process.env.ML_REDIRECT_URI).startsWith('https://'));
+async function mlExchange(params){
+  const reqBody=new URLSearchParams({...params,client_id:process.env.ML_CLIENT_ID,client_secret:process.env.ML_CLIENT_SECRET});
+  const response=await fetch('https://api.mercadolibre.com/oauth/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','Accept':'application/json'},body:reqBody,signal:AbortSignal.timeout(12000)});
+  if(!response.ok)throw new Error('Mercado Livre recusou autenticação ('+response.status+')');
+  const body=await response.json();
+  if(!body.access_token||!body.refresh_token||!Number.isFinite(Number(body.expires_in)))throw new Error('Tokens OAuth inválidos');
+  return body;
+}
+async function mlSaveToken(t){
+  await pool.query('INSERT INTO ml_oauth_tokens(id,access_cipher,refresh_cipher,user_id,token_scope,expires_at,updated_at) VALUES(1,$1,$2,$3,$4,$5,now()) ON CONFLICT(id) DO UPDATE SET access_cipher=excluded.access_cipher,refresh_cipher=excluded.refresh_cipher,user_id=excluded.user_id,token_scope=excluded.token_scope,expires_at=excluded.expires_at,updated_at=now()',
+    [encryptToken(t.access_token),encryptToken(t.refresh_token),String(t.user_id||''),String(t.scope||''),new Date(Date.now()+Number(t.expires_in)*1000-60000).toISOString()]);
+}
+async function mlAccess(){
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const result=await client.query('SELECT * FROM ml_oauth_tokens WHERE id=1 FOR UPDATE');
+    const row=result.rows[0];
+    if(!row){await client.query('COMMIT');return null;}
+    if(Date.parse(row.expires_at)>Date.now()+120000){await client.query('COMMIT');return decryptToken(row.access_cipher);}
+    const renewed=await mlExchange({grant_type:'refresh_token',refresh_token:decryptToken(row.refresh_cipher)});
+    await client.query('UPDATE ml_oauth_tokens SET access_cipher=$1,refresh_cipher=$2,expires_at=$3,updated_at=now(),token_scope=$4 WHERE id=1',
+      [encryptToken(renewed.access_token),encryptToken(renewed.refresh_token),new Date(Date.now()+Number(renewed.expires_in)*1000-60000).toISOString(),String(renewed.scope||'')]);
+    await client.query('COMMIT');
+    return renewed.access_token;
+  }catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}
+}
+
 async function officialMlItem(itemId){
-  const token=process.env.MERCADOLIVRE_ACCESS_TOKEN;
+  const token=await mlAccess().catch(()=>null);
   if(!token)return {data:null,status:'not_configured'};
   if(!/^MLB\d{7,15}$/.test(itemId||''))return {data:null,status:'item_id_unknown'};
   try{
@@ -257,6 +290,26 @@ async function router(req,res) {
     res.writeHead(200,{'Content-Type':type+'; charset=utf-8','Cache-Control':'no-store'});
     return fs.createReadStream(path.join(__dirname,'public',file)).pipe(res);
   }
+  if(route==='/api/ml/oauth-callback'&&req.method==='GET'){
+    const code=u.searchParams.get('code'),st=u.searchParams.get('state'),denied=u.searchParams.get('error');
+    const redirect='/';
+    if(denied||!code||!st){res.writeHead(303,{Location:redirect+'?ml=cancelado'});return res.end();}
+    if(!mlOauthReady()){res.writeHead(303,{Location:redirect+'?ml=configuracao'});return res.end();}
+    const cx=await pool.connect();
+    let verifier=null;
+    try{
+      await cx.query('BEGIN');
+      const lookup=await cx.query('DELETE FROM ml_oauth_flow WHERE state_hash=$1 AND expires_at>now() RETURNING verifier_cipher',[hmac(st)]);
+      if(lookup.rowCount)verifier=decryptToken(lookup.rows[0].verifier_cipher);
+      await cx.query('COMMIT');
+    }catch(e){await cx.query('ROLLBACK');throw e;}finally{cx.release();}
+    if(!verifier){res.writeHead(303,{Location:redirect+'?ml=expirado'});return res.end();}
+    try{
+      const t=await mlExchange({grant_type:'authorization_code',code,redirect_uri:process.env.ML_REDIRECT_URI,code_verifier:verifier});
+      await mlSaveToken(t);
+      res.writeHead(303,{Location:redirect+'?ml=conectado'});return res.end();
+    }catch(e){console.error('Falha OAuth ML',e.message);res.writeHead(303,{Location:redirect+'?ml=erro'});return res.end();}
+  }
   if(route==='/api/login'&&req.method==='POST'){
     if(!originOk(req))return error(res,403,'Origem não autorizada');
     const ip=req.socket.remoteAddress||'unknown',record=attempts.get(ip)||{count:0,until:0};
@@ -278,6 +331,26 @@ async function router(req,res) {
   if(route==='/api/logout'&&req.method==='POST'){
     res.setHeader('Set-Cookie','promos_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0');
     return json(res,200,{ok:true});
+  }
+  if(route==='/api/ml/oauth-status'&&req.method==='GET'){
+    const rows=await pool.query('SELECT user_id,token_scope,expires_at FROM ml_oauth_tokens WHERE id=1');
+    return json(res,200,{configured:mlOauthReady(),connected:rows.rowCount>0,user_id:rows.rows[0]?.user_id||null,expires_at:rows.rows[0]?.expires_at||null,redirect_uri:process.env.ML_REDIRECT_URI||null});
+  }
+  if(route==='/api/ml/oauth-start'&&req.method==='POST'){
+    if(!mlOauthReady())return error(res,409,'Configure ML_CLIENT_ID, ML_CLIENT_SECRET e ML_REDIRECT_URI no Render.');
+    const verifier=crypto.randomBytes(48).toString('base64url'),challenge=crypto.createHash('sha256').update(verifier).digest('base64url');
+    const state=crypto.randomBytes(32).toString('base64url');
+    await pool.query('DELETE FROM ml_oauth_flow WHERE expires_at<now()');
+    await pool.query('INSERT INTO ml_oauth_flow(state_hash,verifier_cipher,expires_at) VALUES($1,$2,now()+interval \'10 minutes\')',[hmac(state),encryptToken(verifier)]);
+    const url=new URL('https://auth.mercadolivre.com.br/authorization');
+    url.searchParams.set('response_type','code');url.searchParams.set('client_id',process.env.ML_CLIENT_ID);
+    url.searchParams.set('redirect_uri',process.env.ML_REDIRECT_URI);url.searchParams.set('state',state);
+    url.searchParams.set('code_challenge',challenge);url.searchParams.set('code_challenge_method','S256');
+    return json(res,200,{authorization_url:url.toString()});
+  }
+  if(route==='/api/ml/oauth-disconnect'&&req.method==='POST'){
+    await pool.query('DELETE FROM ml_oauth_tokens WHERE id=1');
+    return json(res,200,{ok:true,message:'Conexão local removida. Revogue também o acesso no Mercado Livre se desejar.'});
   }
   if(route==='/api/state'&&req.method==='GET')return json(res,200,await state());
   if(route==='/api/ml/import-link'&&req.method==='POST'){
