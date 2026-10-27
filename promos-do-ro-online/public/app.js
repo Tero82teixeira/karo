@@ -102,6 +102,22 @@ window.addEventListener('DOMContentLoaded',()=>{
     try{await api('/api/login','POST',{username:f.elements.username.value,password:f.elements.password.value});f.elements.password.value='';$('loginError').textContent='';await showApp();}
     catch(err){$('loginError').textContent=err.message;}
   });
+  document.querySelectorAll('.quickImportForm').forEach(form=>form.addEventListener('submit',async e=>{
+    e.preventDefault();
+    const btn=form.querySelector('button[type="submit"]'),result=form.parentElement.querySelector('.quickImportResult');
+    const link=form.elements.link.value.trim();
+    btn.disabled=true;btn.textContent='Identificando…';result.textContent='Consultando o link com segurança…';
+    try{
+      const data=await api('/api/ml/import-link','POST',{link});
+      const p=data.product||{};
+      result.textContent=(data.created?'Link importado. ':'Link já cadastrado. ')+(data.message||'')+(p.name?' • '+p.name:'');
+      result.style.color=data.identified?'#92dfbc':'#f4d2a2';
+      await refresh();
+      tab('products');
+      flash(result.textContent,!data.identified);
+    }catch(err){result.textContent=err.message;result.style.color='#ffadb2';}
+    finally{btn.disabled=false;btn.textContent='Importar link';}
+  }));
   $('productForm').addEventListener('submit',async e=>{
     e.preventDefault();const f=e.currentTarget,b=Object.fromEntries(new FormData(f).entries());
     for(const k of ['price','rating','sales','commission_rate','discount'])b[k]=b[k]===''?null:Number(b[k]);
