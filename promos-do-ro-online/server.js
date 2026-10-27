@@ -14,6 +14,7 @@ if (!URL_DB || !PASSWORD || !SECRET || PASSWORD.length < 16 || SECRET.length < 3
 }
 const pool = new Pool({ connectionString: URL_DB, max: 4, connectionTimeoutMillis: 14000, idleTimeoutMillis: 20000 });
 const attempts = new Map();
+const lookupAttempts = new Map();
 const NOW = () => new Date().toISOString();
 const TZ = 'America/Sao_Paulo';
 const json = (res, status, obj) => {
@@ -51,7 +52,7 @@ function isAffiliateLink(raw,platform) {
     const u=new URL(raw);
     if(u.protocol!=='https:'||u.username||u.password||u.port&&u.port!=='443')return false;
     const shopee=['shopee.com.br','www.shopee.com.br','shope.ee','s.shopee.com.br','affiliate.shopee.com.br'];
-    const ml=['mercadolivre.com.br','www.mercadolivre.com.br','mercadolivre.com','www.mercadolivre.com','meli.la'];
+    const ml=['mercadolivre.com.br','www.mercadolivre.com.br','produto.mercadolivre.com.br','mercadolivre.com','www.mercadolivre.com','meli.la'];
     return (platform==='shopee'?shopee:ml).includes(u.hostname.toLowerCase());
   }catch{return false;}
 }
@@ -105,6 +106,91 @@ async function state() {
   ]);
   return {settings:s.rows[0],products:p.rows,campaigns:c.rows,audit:a.rows,stats:k.rows[0],integrations:{shopee:false,telegram:false,instagram:false,whatsapp:false},simulation_only:true};
 }
+
+// Consulta restrita a domínios oficiais: não faz scraping, não armazena cookies e não acessa páginas arbitrárias.
+function cleanMlUrl(value){
+  if(typeof value!=='string'||value.length>1800||!isAffiliateLink(value,'mercado_livre'))
+    throw Object.assign(new Error('Informe um link HTTPS oficial do Mercado Livre ou meli.la'),{status:422});
+  const u=new URL(value);
+  if(u.hash)u.hash='';
+  return u;
+}
+function mlReference(u){
+  const q=u.searchParams.get('item_id')||u.searchParams.get('itemId')||'';
+  const path=u.pathname||'';
+  const listing=(q.match(/^MLB[-]?(\d{7,15})$/i)||path.match(/MLB[-]?(\d{7,15})/i));
+  const cat=path.match(/\/p\/MLB(\d{7,15})(?:\/|$)/i);
+  return {
+    item_id:listing && !cat?'MLB'+listing[1]:null,
+    catalog_id:cat?'MLB'+cat[1]:null
+  };
+}
+async function resolveMlLink(raw){
+  const source=cleanMlUrl(raw);
+  if(source.hostname!=='meli.la')return {final_url:source.origin+source.pathname,reference:mlReference(source),redirect_checked:false,redirect_error:null};
+  let current=source,problem=null;
+  try{
+    for(let hops=0;hops<4&&current.hostname==='meli.la';hops++){
+      let location=null;
+      for(const method of ['HEAD','GET']){
+        const response=await fetch(current.toString(),{method,redirect:'manual',signal:AbortSignal.timeout(5000),headers:{Accept:'*/*'}});
+        location=response.headers.get('location');
+        if(response.body)await response.body.cancel();
+        if(location)break;
+        if(method==='GET')problem='Este link não retornou um redirecionamento verificável';
+      }
+      if(!location)break;
+      const next=new URL(location,current);
+      cleanMlUrl(next.toString());
+      current=next;
+    }
+  }catch(e){problem=e.name==='TimeoutError'?'Tempo de consulta esgotado':'Não foi possível confirmar o redirecionamento';}
+  return {final_url:current.origin+current.pathname,reference:mlReference(current),redirect_checked:current.hostname!=='meli.la',redirect_error:problem};
+}
+async function officialMlItem(itemId){
+  const token=process.env.MERCADOLIVRE_ACCESS_TOKEN;
+  if(!token)return {data:null,status:'not_configured'};
+  if(!/^MLB\d{7,15}$/.test(itemId||''))return {data:null,status:'item_id_unknown'};
+  try{
+    const response=await fetch('https://api.mercadolibre.com/items/'+encodeURIComponent(itemId),{
+      method:'GET',redirect:'error',signal:AbortSignal.timeout(6500),headers:{Authorization:'Bearer '+token,Accept:'application/json'}
+    });
+    if(!response.ok)return {data:null,status:'api_http_'+response.status};
+    const data=await response.json();
+    if(data.id!==itemId||typeof data.title!=='string')return {data:null,status:'invalid_api_response'};
+    return {data,status:'confirmed_api'};
+  }catch(e){return {data:null,status:e.name==='TimeoutError'?'api_timeout':'api_unavailable'};}
+}
+async function importMercadoLivreLink(raw){
+  const input=cleanMlUrl(raw).toString();
+  const previous=await pool.query('SELECT * FROM products WHERE platform=$1 AND affiliate_url=$2 LIMIT 1',['mercado_livre',input]);
+  if(previous.rowCount)return {created:false,product:previous.rows[0],identified:previous.rows[0].source==='mercado_livre_api',message:'Este link já estava cadastrado; informações anteriores preservadas'};
+  const resolution=await resolveMlLink(input);
+  const {item_id:itemId,catalog_id:catalogId}=resolution.reference;
+  const api=await officialMlItem(itemId);
+  const info=api.data;
+  const ident=itemId||catalogId;
+  const title=info?.title?.trim().slice(0,250)||(ident?'Produto Mercado Livre '+ident:'Produto Mercado Livre — identificação pendente');
+  const price=info?.price!==undefined&&Number.isFinite(Number(info.price))&&Number(info.price)>0?Number(info.price):null;
+  const originalPrice=info?.original_price!==undefined&&Number(info.original_price)>0?Number(info.original_price):null;
+  const discount=price!==null&&originalPrice!==null&&originalPrice>price?Math.round((originalPrice-price)*100/originalPrice):null;
+  const photo=info?.pictures?.[0]?.secure_url||info?.pictures?.[0]?.url||info?.thumbnail||null;
+  const p={platform:'mercado_livre',name:title,category:'A identificar',seller:null,price,discount,sales:info&&Number.isFinite(info.sold_quantity)&&info.sold_quantity>=0?info.sold_quantity:null,rating:null,commission_rate:null,image_url:photo,affiliate_url:input};
+  const scoring=evaluate(p);
+  let score=info?scoring.score:0;
+  const reason=info?'Dados oficiais do item recuperados; comissão e avaliações ainda precisam de confirmação':(ident?'ID identificado, porém detalhes indisponíveis sem acesso autorizado à API':'Não foi possível identificar o anúncio somente pelo link');
+  const saved=await pool.query(
+    'INSERT INTO products(id,platform,item_key,name,category,seller,price,discount,sales,rating,commission_rate,commission_amount,image_url,affiliate_url,original_url,source,score,eligible,reason,score_details,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULL,$12,$13,$14,$15,$16,0,$17,$18,$19,$19) ON CONFLICT DO NOTHING RETURNING *',
+    [crypto.randomUUID(),'mercado_livre',ident,title,p.category,p.seller,p.price,p.discount,p.sales,p.rating,null,p.image_url,input,resolution.final_url,info?'mercado_livre_api':'link_pendente',score,reason,JSON.stringify({...scoring.details,api_status:api.status,redirect_checked:resolution.redirect_checked,redirect_error:resolution.redirect_error}),NOW()]
+  );
+  if(!saved.rowCount){
+    const exists=await pool.query('SELECT * FROM products WHERE platform=$1 AND (affiliate_url=$2 OR item_key=$3) ORDER BY updated_at DESC LIMIT 1',['mercado_livre',input,ident]);
+    return {created:false,product:exists.rows[0]||null,identified:!!info,message:'Produto já cadastrado ou associado a outro link. O link existente foi preservado'};
+  }
+  await pool.query('INSERT INTO audit(event,message,created_at) VALUES ($1,$2,$3)',['ml_link_import',saved.rows[0].id,NOW()]);
+  return {created:true,product:saved.rows[0],identified:!!info,api_status:api.status,redirect_checked:resolution.redirect_checked,message:info?'Informações obtidas pela API oficial. Comissão ainda pendente':reason};
+}
+
 async function createProduct(input) {
   const platform=input.platform==='mercado_livre'?'mercado_livre':'shopee';
   const name=String(input.name||'').trim().slice(0,250),category=String(input.category||'Diversos').trim().slice(0,80)||'Diversos';
@@ -194,6 +280,15 @@ async function router(req,res) {
     return json(res,200,{ok:true});
   }
   if(route==='/api/state'&&req.method==='GET')return json(res,200,await state());
+  if(route==='/api/ml/import-link'&&req.method==='POST'){
+    const ip=req.socket.remoteAddress||'unknown',key='ml:'+ip;
+    const rate=lookupAttempts.get(key)||{count:0,until:Date.now()+600000};
+    if(Date.now()>rate.until){rate.count=0;rate.until=Date.now()+600000;}
+    if(rate.count>=18)return error(res,429,'Limite de consultas atingido. Tente novamente mais tarde');
+    rate.count++;lookupAttempts.set(key,rate);
+    const b=await body(req);
+    return json(res,200,{ok:true,...await importMercadoLivreLink(b.link)});
+  }
   if(route==='/api/products/bulk'&&req.method==='POST'){
     const b=await body(req);
     if(!Array.isArray(b.items)||b.items.length===0||b.items.length>30)return error(res,422,'Envie de 1 a 30 produtos por lote');
