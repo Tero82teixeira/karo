@@ -23,6 +23,8 @@ async function showApp(){
   const session=await api('/api/session');csrf=session.csrf;
   $('loginScreen').classList.add('hidden');$('appScreen').classList.remove('hidden');
   await refresh();
+  await mlStatus();
+  if(new URLSearchParams(location.search).has('ml')){flash('Resultado de autorização Mercado Livre: '+new URLSearchParams(location.search).get('ml'));history.replaceState(null,'','/');}
 }
 function tab(name){
   document.querySelectorAll('.section').forEach(x=>x.classList.toggle('active',x.id===name));
@@ -83,6 +85,14 @@ function render(data){
   for(const key of ['min_score','posts_per_day','min_hours','cooldown_days'])$('rulesForm').elements[key].value=s[key];
   $('rulesForm').elements.paused.checked=Boolean(s.paused);
 }
+async function mlStatus(){
+  try{
+    const st=await api('/api/ml/oauth-status');
+    $('mlOauthStatus').textContent=st.connected?'Conectado ao Mercado Livre'+(st.user_id?' • Conta '+st.user_id:''):st.configured?'Aplicativo configurado • Autorização pendente':'Pendente: configurar ML_CLIENT_ID, ML_CLIENT_SECRET e ML_REDIRECT_URI no Render';
+    $('mlConnect').style.display=st.connected?'none':'inline-flex';
+    $('mlDisconnect').style.display=st.connected?'inline-flex':'none';
+  }catch(e){$('mlOauthStatus').textContent='Não foi possível conferir a conexão';}
+}
 async function refresh(){try{render(await api('/api/state'));}catch(e){flash(e.message,true);}}
 async function cycle(){
   try{const x=await api('/api/cycle','POST',{});await refresh();flash(x.message);tab('campaigns');flash(x.message);}
@@ -92,6 +102,9 @@ window.addEventListener('DOMContentLoaded',()=>{
   document.querySelectorAll('.nav').forEach(b=>b.addEventListener('click',()=>tab(b.dataset.tab)));
   document.querySelectorAll('[data-jump]').forEach(b=>b.addEventListener('click',()=>tab(b.dataset.jump)));
   $('refresh').addEventListener('click',refresh);
+  $('mlConnect').addEventListener('click',async()=>{try{const x=await api('/api/ml/oauth-start','POST',{});if(x.authorization_url)window.location.assign(x.authorization_url);}catch(e){flash(e.message,true);$('mlOauthStatus').textContent=e.message;}});
+  $('mlDisconnect').addEventListener('click',async()=>{if(!confirm('Desconectar o Mercado Livre deste painel?'))return;try{await api('/api/ml/oauth-disconnect','POST',{});await mlStatus();flash('Conexão local removida.');}catch(e){flash(e.message,true);}});
+
   $('platformFilter').addEventListener('change',()=>current&&renderProducts(current.products||[]));
   $('cycleButton').addEventListener('click',cycle);
   $('cycleFromHome').addEventListener('click',cycle);
