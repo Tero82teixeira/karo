@@ -1,0 +1,15 @@
+{
+  "name": "promos-do-ro-ia-online",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Painel online Promos do Rô IA, versão inicial em simulação",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "pg": "8.16.3"
+  }
+}
