@@ -27,10 +27,12 @@ async function showApp(){
 function tab(name){
   document.querySelectorAll('.section').forEach(x=>x.classList.toggle('active',x.id===name));
   document.querySelectorAll('.nav').forEach(x=>x.classList.toggle('active',x.dataset.tab===name));
-  const labels={dashboard:'Central de operações',products:'Catálogo de produtos',new:'Cadastrar produto',campaigns:'Fila de campanhas',rules:'Regras e limites',integrations:'Integrações'};
+  const labels={dashboard:'Central de operações',products:'Catálogo de produtos',new:'Cadastrar produto',campaigns:'Fila de campanhas',marketplaces:'Shopee e Mercado Livre',rules:'Regras e limites',integrations:'Canais de divulgação'};
   $('pageTitle').textContent=labels[name]||'Promos do Rô IA';flash('');
 }
 function renderProducts(rows){
+  const filter=$('platformFilter').value;
+  rows=rows.filter(p=>filter==='all'||p.platform===filter);
   const target=$('productsRows');clear(target);
   if(!rows.length){const tr=el('tr');const td=el('td','Nenhum produto cadastrado ainda. Cadastre seu primeiro produto.','empty');td.colSpan=6;tr.append(td);target.append(tr);return;}
   for(const p of rows){
@@ -48,12 +50,12 @@ function renderProducts(rows){
 }
 function renderCampaigns(rows){
   const target=$('campaignRows');clear(target);
-  if(!rows.length){const tr=el('tr');const td=el('td','Ainda não existem campanhas. Execute uma simulação após cadastrar produtos elegíveis.','empty');td.colSpan=5;tr.append(td);target.append(tr);return;}
+  if(!rows.length){const tr=el('tr');const td=el('td','Ainda não existem campanhas. Execute uma simulação após cadastrar produtos elegíveis.','empty');td.colSpan=6;tr.append(td);target.append(tr);return;}
   for(const c of rows){
     const tr=el('tr');const copy=el('button','Copiar texto','btn');copy.addEventListener('click',async()=>{
       try{await navigator.clipboard.writeText(c.copy);flash('Texto copiado!');}catch{flash('Não foi possível copiar automaticamente.',true);}
     });
-    const td=el('td');td.append(copy);tr.append(el('td',c.product_name),el('td','Telegram (simulação)'),el('td',day(c.scheduled_at)),el('td',c.status),td);target.append(tr);
+    const td=el('td');td.append(copy);tr.append(el('td',c.product_name),el('td',c.product_platform==='shopee'?'Shopee':'Mercado Livre'),el('td','Telegram (simulação)'),el('td',day(c.scheduled_at)),el('td',c.status),td);target.append(tr);
   }
 }
 function renderAudit(rows){
@@ -72,6 +74,8 @@ function render(data){
   $('countEligible').textContent=data.stats.eligible??0;
   $('countSimulated').textContent=data.stats.simulated??0;
   $('countPublished').textContent=data.stats.published??0;
+  $('shopeeCount').textContent=(data.products||[]).filter(p=>p.platform==='shopee').length;
+  $('mercadoCount').textContent=(data.products||[]).filter(p=>p.platform==='mercado_livre').length;
   renderProducts(data.products||[]);
   renderCampaigns(data.campaigns||[]);
   renderAudit(data.audit||[]);
@@ -88,6 +92,7 @@ window.addEventListener('DOMContentLoaded',()=>{
   document.querySelectorAll('.nav').forEach(b=>b.addEventListener('click',()=>tab(b.dataset.tab)));
   document.querySelectorAll('[data-jump]').forEach(b=>b.addEventListener('click',()=>tab(b.dataset.jump)));
   $('refresh').addEventListener('click',refresh);
+  $('platformFilter').addEventListener('change',()=>current&&renderProducts(current.products||[]));
   $('cycleButton').addEventListener('click',cycle);
   $('cycleFromHome').addEventListener('click',cycle);
   $('exportCsv').addEventListener('click',()=>{window.location.href='/api/export.csv';});
@@ -102,6 +107,26 @@ window.addEventListener('DOMContentLoaded',()=>{
     for(const k of ['price','rating','sales','commission_rate','discount'])b[k]=b[k]===''?null:Number(b[k]);
     try{const r=await api('/api/products','POST',b);await refresh();tab('products');flash('Produto cadastrado! Nota: '+r.score+'/100. '+r.reason);f.reset();}
     catch(err){flash(err.message,true);}
+  });
+  $('bulkSubmit').addEventListener('click',async()=>{
+    const button=$('bulkSubmit'),raw=$('bulkLines').value.trim();
+    if(!raw){flash('Cole ao menos uma linha de produto.',true);return;}
+    const rows=raw.split(/\r?\n/).map(x=>x.trim()).filter(Boolean).filter(x=>!/^nome\s*[;|]/i.test(x));
+    if(rows.length>30){flash('Limite de 30 produtos por lote.',true);return;}
+    const decimal=x=>{const v=(x||'').trim().replace(',','.');return v?Number(v):null;};
+    const items=rows.map(row=>{
+      const c=row.split(';').map(x=>x.trim());
+      return {platform:$('bulkPlatform').value,name:c[0]||'',affiliate_url:c[1]||'',price:decimal(c[2]),rating:decimal(c[3]),sales:decimal(c[4]),commission_rate:decimal(c[5]),discount:decimal(c[6]),category:c[7]||'Diversos'};
+    });
+    try{
+      button.disabled=true;button.textContent='Importando…';
+      const result=await api('/api/products/bulk','POST',{items});
+      await refresh();tab('products');
+      const problems=(result.errors||[]).slice(0,3).map(x=>'Linha '+x.line+': '+x.error).join(' • ');
+      flash(result.created+' produtos importados; '+result.duplicates+' duplicados. '+(result.errors||[]).length+' erros. '+problems,(result.errors||[]).length>0);
+      if(result.created>0)$('bulkLines').value='';
+    }catch(err){flash(err.message,true);}
+    finally{button.disabled=false;button.textContent='Importar e avaliar lote';}
   });
   $('rulesForm').addEventListener('submit',async e=>{
     e.preventDefault();const f=e.currentTarget;
