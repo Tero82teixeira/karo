@@ -99,7 +99,7 @@ async function state() {
   const [s,p,c,a,k] = await Promise.all([
     pool.query('SELECT * FROM settings WHERE id=1'),
     pool.query('SELECT * FROM products ORDER BY updated_at DESC LIMIT 300'),
-    pool.query('SELECT c.*,p.name AS product_name FROM campaigns c JOIN products p ON p.id=c.product_id ORDER BY c.created_at DESC LIMIT 200'),
+    pool.query('SELECT c.*,p.name AS product_name,p.platform AS product_platform FROM campaigns c JOIN products p ON p.id=c.product_id ORDER BY c.created_at DESC LIMIT 200'),
     pool.query('SELECT id,event,message,created_at FROM audit ORDER BY id DESC LIMIT 80'),
     pool.query("SELECT (SELECT COUNT(*)::int FROM products) products, (SELECT COUNT(*)::int FROM campaigns WHERE status='simulated') simulated, (SELECT COUNT(*)::int FROM campaigns WHERE status='published') published, (SELECT COUNT(*)::int FROM products WHERE eligible=1 AND score >= (SELECT min_score FROM settings WHERE id=1)) eligible")
   ]);
@@ -194,6 +194,21 @@ async function router(req,res) {
     return json(res,200,{ok:true});
   }
   if(route==='/api/state'&&req.method==='GET')return json(res,200,await state());
+  if(route==='/api/products/bulk'&&req.method==='POST'){
+    const b=await body(req);
+    if(!Array.isArray(b.items)||b.items.length===0||b.items.length>30)return error(res,422,'Envie de 1 a 30 produtos por lote');
+    const report={created:0,duplicates:0,errors:[]};
+    for(let i=0;i<b.items.length;i++){
+      const item=b.items[i];
+      if(!item||typeof item!=='object'||Array.isArray(item)){report.errors.push({line:i+1,error:'Formato de produto inválido'});continue;}
+      try{await createProduct(item);report.created++;}
+      catch(e){
+        if(e.code==='23505'){report.duplicates++;continue;}
+        report.errors.push({line:i+1,error:e.status===422?e.message:'Não foi possível importar esta linha'});
+      }
+    }
+    return json(res,200,{ok:true,...report});
+  }
   if(route==='/api/products'&&req.method==='POST'){
     try{return json(res,201,{ok:true,...await createProduct(await body(req))});}
     catch(e){if(e.code==='23505')return error(res,409,'Produto duplicado');throw e;}
