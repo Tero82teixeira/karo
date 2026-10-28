@@ -44,7 +44,22 @@ function renderProducts(rows){
     const td3=el('td',p.commission_rate===null?'—':p.commission_rate+'%');
     const td4=el('td');td4.append(el('span',p.score+'/100','score '+(p.score>=80?'ok':'low')));
     const td5=el('td');td5.append(el('div',p.eligible?'Dados suficientes':'Não elegível','status'),el('div',p.reason||'—','muted'));
-    const td6=el('td');const button=el('button','Excluir','btn btn-danger');button.addEventListener('click',async()=>{
+    const td6=el('td');
+    if(p.platform==='mercado_livre' && p.affiliate_url){
+      const sync=el('button','↻ Atualizar','btn');
+      sync.style.marginRight='7px';
+      sync.addEventListener('click',async()=>{
+        sync.disabled=true;sync.textContent='Consultando…';
+        try{
+          const x=await api('/api/ml/import-link','POST',{link:p.affiliate_url});
+          await refresh();
+          flash(x.message||'Consulta concluída',!x.identified);
+        }catch(e){flash(e.message,true);}
+        finally{sync.disabled=false;sync.textContent='↻ Atualizar';}
+      });
+      td6.append(sync);
+    }
+    const button=el('button','Excluir','btn btn-danger');button.addEventListener('click',async()=>{
       if(!window.confirm('Excluir este produto?'))return;
       try{await api('/api/products/'+encodeURIComponent(p.id),'DELETE');flash('Produto excluído.');await refresh();}catch(e){flash(e.message,true);}
     });td6.append(button);tr.append(td1,td2,td3,td4,td5,td6);target.append(tr);
