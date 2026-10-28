@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { Pool } = require('pg');
+const { lookupMlOfficial } = require('./ml_catalog');
 
 const URL_DB = process.env.DATABASE_URL;
 const USER = process.env.PROMOS_ADMIN_USER || 'admin';
@@ -208,8 +209,9 @@ async function importMercadoLivreLink(raw){
   if(previous.rowCount){
     const old=previous.rows[0];
     const resolution=await resolveMlLink(input);
-    const itemId=resolution.reference.item_id || (/^MLB\d{7,15}$/.test(old.item_key||'')?old.item_key:null);
-    const api=await officialMlItem(itemId);
+    const reference={...resolution.reference};
+    if(!reference.item_id && !reference.catalog_id && old.source==='mercado_livre_api' && /^MLB\d{7,15}$/.test(old.item_key||''))reference.item_id=old.item_key;
+    const api=await lookupMlOfficial(reference,mlAccess,officialMlItem);
     if(!api.data)return {created:false,product:old,identified:false,api_status:api.status,message:'Link já cadastrado. Consulta oficial pendente ('+api.status+'); dados preservados.'};
     const info=api.data;
     const price=Number(info.price);
@@ -220,13 +222,13 @@ async function importMercadoLivreLink(raw){
     const p={...old,name:info.title||old.name,price:newPrice,discount,image_url:pic,commission_rate:old.commission_rate};
     const ev=evaluate(p);
     const reason=ev.reason==='Dados suficientes para seleção'?'Comissão de afiliado exige confirmação':ev.reason;
-    const updated=await pool.query("UPDATE products SET item_key=COALESCE(item_key,$2),name=$3,price=$4,discount=$5,image_url=$6,source='mercado_livre_api',score=$7,eligible=0,reason=$8,score_details=$9,updated_at=$10 WHERE id=$1 RETURNING *",
-      [old.id,info.id,p.name,p.price,p.discount,p.image_url,ev.score,reason,JSON.stringify({...ev.details,last_api_status:'confirmed_api'}),NOW()]);
-    return {created:false,product:updated.rows[0],identified:true,api_status:'confirmed_api',message:'Produto atualizado pela API oficial. Comissão de afiliado ainda não confirmada.'};
+    const updated=await pool.query("UPDATE products SET item_key=COALESCE(item_key,$2),name=$3,price=$4,discount=$5,image_url=$6,source=CASE WHEN $11='catalog' THEN 'mercado_livre_catalog_api' ELSE 'mercado_livre_api' END,score=$7,eligible=0,reason=$8,score_details=$9,updated_at=$10 WHERE id=$1 RETURNING *",
+      [old.id,info.id,p.name,p.price,p.discount,p.image_url,ev.score,reason,JSON.stringify({...ev.details,last_api_status:api.status}),NOW(),info.source_kind||'item']);
+    return {created:false,product:updated.rows[0],identified:true,api_status:api.status,message:info.source_kind==='catalog'?'Catálogo identificado. Preço anterior preservado; comissão ainda pendente.':'Anúncio atualizado pela API oficial. Comissão ainda pendente.'};
   }
   const resolution=await resolveMlLink(input);
   const {item_id:itemId,catalog_id:catalogId}=resolution.reference;
-  const api=await officialMlItem(itemId);
+  const api=await lookupMlOfficial({item_id:itemId,catalog_id:catalogId},mlAccess,officialMlItem);
   const info=api.data;
   const ident=itemId||catalogId;
   const title=info?.title?.trim().slice(0,250)||(ident?'Produto Mercado Livre '+ident:'Produto Mercado Livre — identificação pendente');
@@ -237,10 +239,10 @@ async function importMercadoLivreLink(raw){
   const p={platform:'mercado_livre',name:title,category:'A identificar',seller:null,price,discount,sales:info&&Number.isFinite(info.sold_quantity)&&info.sold_quantity>=0?info.sold_quantity:null,rating:null,commission_rate:null,image_url:photo,affiliate_url:input};
   const scoring=evaluate(p);
   let score=info?scoring.score:0;
-  const reason=info?'Dados oficiais do item recuperados; comissão e avaliações ainda precisam de confirmação':(ident?'ID identificado, porém detalhes indisponíveis sem acesso autorizado à API':'Não foi possível identificar o anúncio somente pelo link');
+  const reason=info?(info.source_kind==='catalog'?'Dados oficiais de catálogo; preço exato e comissão ainda não confirmados':'Dados oficiais do anúncio; comissão e avaliações não confirmadas'):(ident?'ID identificado, porém consulta oficial indisponível ('+api.status+')':'Não foi possível identificar o anúncio pelo link curto'+(resolution.redirect_error?': '+resolution.redirect_error:''));
   const saved=await pool.query(
     'INSERT INTO products(id,platform,item_key,name,category,seller,price,discount,sales,rating,commission_rate,commission_amount,image_url,affiliate_url,original_url,source,score,eligible,reason,score_details,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULL,$12,$13,$14,$15,$16,0,$17,$18,$19,$19) ON CONFLICT DO NOTHING RETURNING *',
-    [crypto.randomUUID(),'mercado_livre',ident,title,p.category,p.seller,p.price,p.discount,p.sales,p.rating,null,p.image_url,input,resolution.final_url,info?'mercado_livre_api':'link_pendente',score,reason,JSON.stringify({...scoring.details,api_status:api.status,redirect_checked:resolution.redirect_checked,redirect_error:resolution.redirect_error}),NOW()]
+    [crypto.randomUUID(),'mercado_livre',ident,title,p.category,p.seller,p.price,p.discount,p.sales,p.rating,null,p.image_url,input,resolution.final_url,info?(info.source_kind==='catalog'?'mercado_livre_catalog_api':'mercado_livre_api'):'link_pendente',score,reason,JSON.stringify({...scoring.details,api_status:api.status,redirect_checked:resolution.redirect_checked,redirect_error:resolution.redirect_error}),NOW()]
   );
   if(!saved.rowCount){
     const exists=await pool.query('SELECT * FROM products WHERE platform=$1 AND (affiliate_url=$2 OR item_key=$3) ORDER BY updated_at DESC LIMIT 1',['mercado_livre',input,ident]);
