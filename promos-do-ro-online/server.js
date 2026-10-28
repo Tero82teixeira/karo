@@ -212,7 +212,12 @@ async function importMercadoLivreLink(raw){
     const reference={...resolution.reference};
     if(!reference.item_id && !reference.catalog_id && old.source==='mercado_livre_api' && /^MLB\d{7,15}$/.test(old.item_key||''))reference.item_id=old.item_key;
     const api=await lookupMlOfficial(reference,mlAccess,officialMlItem);
-    if(!api.data)return {created:false,product:old,identified:false,api_status:api.status,message:'Link já cadastrado. Consulta oficial pendente ('+api.status+'); dados preservados.'};
+    if(!api.data){
+      const why=api.status==='item_id_unknown'
+        ?'O link curto não revelou o código do anúncio'+(resolution.redirect_error?' ('+resolution.redirect_error+')':'')+'. É necessário identificar o endereço completo da página.'
+        :api.status.includes('403')?'O Mercado Livre não autorizou a consulta deste anúncio.':'A consulta oficial não retornou dados ('+api.status+').';
+      return {created:false,product:old,identified:false,api_status:api.status,redirect_checked:resolution.redirect_checked,message:'Link já cadastrado. '+why+' Nome, preço e link anteriores foram preservados.'};
+    }
     const info=api.data;
     const price=Number(info.price);
     const newPrice=Number.isFinite(price)&&price>0?price:old.price;
