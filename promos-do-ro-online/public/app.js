@@ -58,6 +58,22 @@ function renderProducts(rows){
         finally{sync.disabled=false;sync.textContent='↻ Atualizar';}
       });
       td6.append(sync);
+      const associate=el('button',p.original_url&&/MLB\d{7,15}/i.test(p.original_url)?'✓ URL vinculada':'Vincular URL completa','btn');
+      associate.style.marginRight='7px';
+      associate.style.marginTop='5px';
+      associate.addEventListener('click',async()=>{
+        const original=window.prompt('Cole a URL COMPLETA da página deste MESMO produto no Mercado Livre, sem usar o link curto meli.la. O link de afiliado atual será preservado.',p.original_url||'');
+        if(!original)return;
+        if(!window.confirm('Confirma que esse endereço completo é do mesmo produto? Seu link curto de afiliado será preservado.'))return;
+        associate.disabled=true;associate.textContent='Vinculando…';
+        try{
+          const x=await api('/api/ml/associate-original','POST',{product_id:p.id,original_url:original.trim()});
+          await refresh();
+          flash('Identificador '+x.identifier+' vinculado. '+(x.message||''),!x.identified);
+        }catch(e){flash(e.message,true);}
+        finally{associate.disabled=false;associate.textContent='Vincular URL completa';}
+      });
+      td6.append(associate);
     }
     const button=el('button','Excluir','btn btn-danger');button.addEventListener('click',async()=>{
       if(!window.confirm('Excluir este produto?'))return;
