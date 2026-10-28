@@ -208,7 +208,7 @@ async function importMercadoLivreLink(raw){
   const previous=await pool.query('SELECT * FROM products WHERE platform=$1 AND affiliate_url=$2 LIMIT 1',['mercado_livre',input]);
   if(previous.rowCount){
     const old=previous.rows[0];
-    const resolution=await resolveMlLink(input);
+    const resolution=await resolveMlLink(old.original_url && old.original_url.startsWith('https://') ? old.original_url : input);
     const reference={...resolution.reference};
     if(!reference.item_id && !reference.catalog_id && old.source==='mercado_livre_api' && /^MLB\d{7,15}$/.test(old.item_key||''))reference.item_id=old.item_key;
     const api=await lookupMlOfficial(reference,mlAccess,officialMlItem);
@@ -386,6 +386,26 @@ async function router(req,res) {
     return json(res,200,{ok:true,message:'Conexão local removida. Revogue também o acesso no Mercado Livre se desejar.'});
   }
   if(route==='/api/state'&&req.method==='GET')return json(res,200,await state());
+  if(route==='/api/ml/associate-original'&&req.method==='POST'){
+    const data=await body(req);
+    const original=cleanMlUrl(data.original_url);
+    if(original.hostname==='meli.la')return error(res,422,'Use a URL completa do produto, não outro link curto meli.la');
+    const ref=mlReference(original);
+    const id=ref.item_id||ref.catalog_id;
+    if(!id)return error(res,422,'Essa URL não contém um código de anúncio MLB reconhecível. Copie a página do produto específico.');
+    const product=await pool.query('SELECT * FROM products WHERE id=$1 AND platform=$2',[String(data.product_id||''),'mercado_livre']);
+    if(!product.rowCount)return error(res,404,'Produto Mercado Livre não encontrado');
+    if(product.rows[0].item_key && product.rows[0].item_key!==id)
+      return error(res,409,'Este produto já está vinculado a outro identificador. Confirme o anúncio antes de alterar.');
+    const matched=await pool.query('SELECT id FROM products WHERE platform=$1 AND item_key=$2 AND id<>$3 LIMIT 1',['mercado_livre',id,product.rows[0].id]);
+    if(matched.rowCount)return error(res,409,'Outro produto já utiliza esse identificador MLB.');
+    await pool.query('UPDATE products SET original_url=$2,item_key=COALESCE(item_key,$3),reason=$4,updated_at=$5 WHERE id=$1',
+      [product.rows[0].id,original.toString(),id,'URL completa vinculada; tentando atualizar dados pela API oficial',NOW()]);
+    await pool.query('INSERT INTO audit(event,message,created_at) VALUES($1,$2,$3)',
+      ['ml_product_url_associated',product.rows[0].id+' • '+id,NOW()]);
+    const refreshed=await importMercadoLivreLink(product.rows[0].affiliate_url);
+    return json(res,200,{ok:true,linked:true,identifier:id,...refreshed});
+  }
   if(route==='/api/ml/import-link'&&req.method==='POST'){
     const ip=req.socket.remoteAddress||'unknown',key='ml:'+ip;
     const rate=lookupAttempts.get(key)||{count:0,until:Date.now()+600000};
