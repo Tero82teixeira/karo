@@ -116,36 +116,44 @@ function cleanMlUrl(value){
   return u;
 }
 function mlReference(u){
-  const q=u.searchParams.get('item_id')||u.searchParams.get('itemId')||'';
-  const path=u.pathname||'';
-  const listing=(q.match(/^MLB[-]?(\d{7,15})$/i)||path.match(/MLB[-]?(\d{7,15})/i));
-  const cat=path.match(/\/p\/MLB(\d{7,15})(?:\/|$)/i);
+  const pathname=u.pathname||'';
+  const cat=pathname.match(/\/p\/(MLB\d{7,15})(?:\/|$)/i);
+  const queryValues=['item_id','itemId','wid','pdp_filters','item'].map(k=>u.searchParams.get(k)||'');
+  const listingInQuery=queryValues.map(v=>v.match(/(?:^|[^A-Z0-9])MLB[-]?(\d{7,15})(?!\d)/i)).find(Boolean);
+  const listingInPath=!cat && pathname.match(/(?:^|[/-])MLB[-]?(\d{7,15})(?!\d)/i);
   return {
-    item_id:listing && !cat?'MLB'+listing[1]:null,
-    catalog_id:cat?'MLB'+cat[1]:null
+    item_id:listingInQuery?'MLB'+listingInQuery[1]:listingInPath?'MLB'+listingInPath[1]:null,
+    catalog_id:cat?cat[1].toUpperCase():null
   };
 }
 async function resolveMlLink(raw){
   const source=cleanMlUrl(raw);
-  if(source.hostname!=='meli.la')return {final_url:source.origin+source.pathname,reference:mlReference(source),redirect_checked:false,redirect_error:null};
-  let current=source,problem=null;
+  if(source.hostname!=='meli.la')return {final_url:source.origin+source.pathname,reference:mlReference(source),redirect_checked:true,redirect_error:null};
+  let current=source,problem=null,hops=0;
+  const visited=new Set();
   try{
-    for(let hops=0;hops<4&&current.hostname==='meli.la';hops++){
-      let location=null;
+    for(;hops<6;hops++){
+      const ref=mlReference(current);
+      if(ref.item_id||ref.catalog_id)break;
+      if(visited.has(current.href)){problem='Redirecionamento circular';break;}
+      visited.add(current.href);
+      let location=null,lastStatus=null;
       for(const method of ['HEAD','GET']){
-        const response=await fetch(current.toString(),{method,redirect:'manual',signal:AbortSignal.timeout(5000),headers:{Accept:'*/*'}});
+        const response=await fetch(current.toString(),{method,redirect:'manual',signal:AbortSignal.timeout(6000),headers:{Accept:'*/*'}});
+        lastStatus=response.status;
         location=response.headers.get('location');
         if(response.body)await response.body.cancel();
         if(location)break;
-        if(method==='GET')problem='Este link não retornou um redirecionamento verificável';
       }
-      if(!location)break;
+      if(!location){problem='O encurtador não forneceu a URL completa (HTTP '+lastStatus+')';break;}
       const next=new URL(location,current);
       cleanMlUrl(next.toString());
       current=next;
     }
-  }catch(e){problem=e.name==='TimeoutError'?'Tempo de consulta esgotado':'Não foi possível confirmar o redirecionamento';}
-  return {final_url:current.origin+current.pathname,reference:mlReference(current),redirect_checked:current.hostname!=='meli.la',redirect_error:problem};
+  }catch(e){problem=e.name==='TimeoutError'?'Tempo limite de redirecionamento excedido':'Não foi possível seguir o redirecionamento oficial';}
+  const ref=mlReference(current);
+  if(!ref.item_id&&!ref.catalog_id&&!problem)problem='URL final não contém identificador de anúncio nem de catálogo';
+  return {final_url:current.origin+current.pathname,reference:ref,redirect_checked:current.hostname!=='meli.la',redirect_error:problem,redirect_steps:hops};
 }
 
 const mlCryptoKey=crypto.createHash('sha256').update(SECRET+':ml-oauth-v1').digest();
