@@ -197,7 +197,25 @@ async function officialMlItem(itemId){
 async function importMercadoLivreLink(raw){
   const input=cleanMlUrl(raw).toString();
   const previous=await pool.query('SELECT * FROM products WHERE platform=$1 AND affiliate_url=$2 LIMIT 1',['mercado_livre',input]);
-  if(previous.rowCount)return {created:false,product:previous.rows[0],identified:previous.rows[0].source==='mercado_livre_api',message:'Este link já estava cadastrado; informações anteriores preservadas'};
+  if(previous.rowCount){
+    const old=previous.rows[0];
+    const resolution=await resolveMlLink(input);
+    const itemId=resolution.reference.item_id || (/^MLB\d{7,15}$/.test(old.item_key||'')?old.item_key:null);
+    const api=await officialMlItem(itemId);
+    if(!api.data)return {created:false,product:old,identified:false,api_status:api.status,message:'Link já cadastrado. Consulta oficial pendente ('+api.status+'); dados preservados.'};
+    const info=api.data;
+    const price=Number(info.price);
+    const newPrice=Number.isFinite(price)&&price>0?price:old.price;
+    const original=Number(info.original_price);
+    const discount=Number.isFinite(original)&&original>newPrice?Math.round((original-newPrice)*100/original):old.discount;
+    const pic=info.pictures?.[0]?.secure_url||info.pictures?.[0]?.url||info.thumbnail||old.image_url;
+    const p={...old,name:info.title||old.name,price:newPrice,discount,image_url:pic,commission_rate:old.commission_rate};
+    const ev=evaluate(p);
+    const reason=ev.reason==='Dados suficientes para seleção'?'Comissão de afiliado exige confirmação':ev.reason;
+    const updated=await pool.query("UPDATE products SET item_key=COALESCE(item_key,$2),name=$3,price=$4,discount=$5,image_url=$6,source='mercado_livre_api',score=$7,eligible=0,reason=$8,score_details=$9,updated_at=$10 WHERE id=$1 RETURNING *",
+      [old.id,info.id,p.name,p.price,p.discount,p.image_url,ev.score,reason,JSON.stringify({...ev.details,last_api_status:'confirmed_api'}),NOW()]);
+    return {created:false,product:updated.rows[0],identified:true,api_status:'confirmed_api',message:'Produto atualizado pela API oficial. Comissão de afiliado ainda não confirmada.'};
+  }
   const resolution=await resolveMlLink(input);
   const {item_id:itemId,catalog_id:catalogId}=resolution.reference;
   const api=await officialMlItem(itemId);
